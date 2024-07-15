@@ -1,155 +1,201 @@
 #!/usr/bin/python
-
+# main.py
 import sys
-import torch
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QTextEdit)
-from PyQt6.QtCore import Qt, QTimer
-from transformers import MarianMTModel, MarianTokenizer
+import re
+import os
+import subprocess
+from PyQt6.QtWidgets import QApplication, QMessageBox
+from gui import TranslatorApp
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from langdetect import detect, LangDetectException
 
-class TranslatorApp(QMainWindow):
-    def __init__(self):
-        super().__init__()
+# Palabras clave especiales de Ren'Py
+SPECIAL_KEYWORDS = ["define", "label", "scene", "show", "hide", "play", "stop", "pause", "queue", "window", "with", "menu", "jump", "call", "return", "if", "elif", "else"]
 
-        # Configuración inicial del modelo y tokenizador
-        self.model_name = "Helsinki-NLP/opus-mt-en-es"
-        self.tokenizer = MarianTokenizer.from_pretrained(self.model_name)
-        self.model = MarianMTModel.from_pretrained(self.model_name)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self.model.to(self.device)
+def is_text_in_target_language(text, target_language_code):
+    try:
+        detected_language = detect(text)
+        return detected_language == target_language_code
+    except LangDetectException:
+        return False
 
-        self.is_translating = False
-        self.translation_timer = QTimer(self)
-        self.translation_timer.timeout.connect(self.translate_text)
+def should_translate_line(line):
+    """Determina si una línea debe ser traducida o no."""
+    stripped_line = line.strip()
+    if any(stripped_line.startswith(keyword) for keyword in SPECIAL_KEYWORDS):
+        return False
+    if '{' in stripped_line or '}' in stripped_line or '[' in stripped_line or ']' in stripped_line:
+        return False
+    return True
 
-        self.initUI()  # Llamar después de inicializar los atributos necesarios
+def read_lines_with_fallback(file_path, encodings=['utf-8', 'latin-1', 'iso-8859-1']):
+    """Intenta leer un archivo con diferentes codificaciones hasta que tenga éxito."""
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as file:
+                return file.readlines()
+        except UnicodeDecodeError:
+            continue
+    # Si todas las codificaciones fallan, volver a leer el archivo ignorando errores
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+        return file.readlines()
 
-    def initUI(self):
-        self.setWindowTitle('Translator App')
-        self.setGeometry(100, 100, 600, 300)  # Altura reducida
+def ensure_spaces_around_brackets(text):
+    """Asegura que haya espacios alrededor de las variables en corchetes."""
+    text = re.sub(r'\[([^\]]+)\]', r' [\1] ', text)
+    return text
 
-        # Widget principal y layout vertical
-        main_widget = QWidget(self)
-        self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout()
-        main_widget.setLayout(main_layout)
+def preserve_html_colors(text):
+    """Preserva los colores HTML dentro de las frases."""
+    return re.sub(r'(<[^>]+>)', r' \1 ', text)
 
-        # Etiqueta para mostrar el modelo actual
-        self.model_label = QLabel(f"Modelo actual: {self.model_name}")
-        main_layout.addWidget(self.model_label)
+def translate_text_in_file(file_path, tokenizer, model, device, max_length, num_beams, temperature, repetition_penalty, length_penalty, no_repeat_ngram_size, progress_callback):
+    lines = read_lines_with_fallback(file_path)
 
-        # Sliders en una línea horizontal
-        sliders_layout = QHBoxLayout()
+    translated_lines = []
+    total_lines = len(lines)
+    if progress_callback:
+        progress_callback(0)
 
-        self.max_length_slider = QSlider(Qt.Orientation.Horizontal)
-        self.max_length_slider.setMinimum(64)
-        self.max_length_slider.setMaximum(512)
-        self.max_length_slider.setValue(128)
-        self.max_length_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.max_length_slider.setTickInterval(64)
-        self.max_length_slider.valueChanged.connect(self.update_slider_labels)
-        sliders_layout.addWidget(QLabel("Máxima longitud de salida:"))
-        self.max_length_label = QLabel(f"{self.max_length_slider.value()}")
-        sliders_layout.addWidget(self.max_length_label)
-        sliders_layout.addWidget(self.max_length_slider)
+    index = 0
+    while index < total_lines:
+        line = lines[index]
+        stripped_line = line.strip()
 
-        self.num_beams_slider = QSlider(Qt.Orientation.Horizontal)
-        self.num_beams_slider.setMinimum(1)
-        self.num_beams_slider.setMaximum(8)
-        self.num_beams_slider.setValue(4)
-        self.num_beams_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.num_beams_slider.setTickInterval(1)
-        self.num_beams_slider.valueChanged.connect(self.update_slider_labels)
-        sliders_layout.addWidget(QLabel("Número de beams:"))
-        self.num_beams_label = QLabel(f"{self.num_beams_slider.value()}")
-        sliders_layout.addWidget(self.num_beams_label)
-        sliders_layout.addWidget(self.num_beams_slider)
+        if not should_translate_line(line):
+            translated_lines.append(line)
+            index += 1
+            continue
 
-        main_layout.addLayout(sliders_layout)
+        if stripped_line.startswith("translate CUSTOM"):
+            variable_name = stripped_line.split()[2].strip(":")
+            translated_lines.append(line)
+            index += 1
 
-        # Frame y QTextEdit para el texto de origen
-        source_frame = QWidget()
-        source_layout = QVBoxLayout()
-        source_frame.setLayout(source_layout)
-        source_layout.addWidget(QLabel("Texto de Origen"))
-        self.source_textedit = QTextEdit()
-        source_layout.addWidget(self.source_textedit, 1)
-        main_layout.addWidget(source_frame)
+            if index < total_lines:
+                next_line = lines[index]
+                stripped_next_line = next_line.strip()
+                if stripped_next_line.startswith("#") or stripped_next_line.startswith("translate"):
+                    translated_lines.append(next_line)
+                elif '"' in stripped_next_line and not stripped_next_line.startswith("old"):
+                    parts = stripped_next_line.split('"')
+                    if len(parts) > 1:
+                        original_text = parts[1].strip()
 
-        # Frame y QTextEdit para el texto traducido
-        target_frame = QWidget()
-        target_layout = QVBoxLayout()
-        target_frame.setLayout(target_layout)
-        target_layout.addWidget(QLabel("Texto Traducido"))
-        self.target_textedit = QTextEdit()
-        self.target_textedit.setReadOnly(True)
-        target_layout.addWidget(self.target_textedit, 1)
-        main_layout.addWidget(target_frame)
+                        if is_text_in_target_language(original_text, "es"):
+                            translated_lines.append(next_line)
+                        else:
+                            try:
+                                original_text_parts = re.split(r'(\[.*?\]|\{.*?\}|\<.*?\>)', original_text)
+                                translated_text_parts = []
+                                for part in original_text_parts:
+                                    if re.match(r'[\[\]\{\}\<\>]', part):
+                                        translated_text_parts.append(part)
+                                    else:
+                                        inputs = tokenizer(part, return_tensors="pt").to(device)
+                                        translated_ids = model.generate(
+                                            inputs["input_ids"],
+                                            max_length=max_length,
+                                            num_beams=num_beams,
+                                            temperature=temperature,
+                                            repetition_penalty=repetition_penalty,
+                                            length_penalty=length_penalty,
+                                            no_repeat_ngram_size=no_repeat_ngram_size,
+                                            early_stopping=True
+                                        )
+                                        translated_text = tokenizer.decode(translated_ids[0], skip_special_tokens=True)
+                                        translated_text_parts.append(translated_text)
 
-        # Botones para controlar la traducción
-        btn_layout = QHBoxLayout()
-        main_layout.addLayout(btn_layout)
+                                translated_text = ''.join(translated_text_parts)
+                                translated_text = ensure_spaces_around_brackets(translated_text)
+                                translated_text = preserve_html_colors(translated_text)
+                            except Exception as e:
+                                translated_text = f'{original_text}  # Error: {str(e)}'
 
-        self.start_btn = QPushButton("Iniciar Traducción")
-        self.start_btn.clicked.connect(self.start_translation)
-        btn_layout.addWidget(self.start_btn)
+                            indentation = next_line[:next_line.index(stripped_next_line)]
+                            translated_line = f'{indentation}translate CUSTOM {variable_name}:\n'
+                            translated_line += f'{indentation}    "{translated_text}"\n'
+                            translated_lines.append(translated_line)
+                    else:
+                        translated_lines.append(next_line)
+                else:
+                    translated_lines.append(next_line)
+            else:
+                translated_lines.append(line)
+        elif stripped_line.startswith("#") or stripped_line.startswith("translate"):
+            translated_lines.append(line)
+        else:
+            if '"' in stripped_line and stripped_line.count('"') >= 2 and not stripped_line.startswith("old"):
+                parts = stripped_line.split('"')
+                if len(parts) >= 3:
+                    text_to_translate = parts[1].strip()
 
-        self.stop_btn = QPushButton("Detener Traducción")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop_translation)
-        btn_layout.addWidget(self.stop_btn)
+                    if is_text_in_target_language(text_to_translate, "es"):
+                        translated_lines.append(line)
+                    else:
+                        try:
+                            text_parts = re.split(r'(\[.*?\]|\{.*?\}|\<.*?\>)', text_to_translate)
+                            translated_parts = []
+                            for part in text_parts:
+                                if re.match(r'[\[\]\{\}\<\>]', part):
+                                    translated_parts.append(part)
+                                else:
+                                    inputs = tokenizer(part, return_tensors="pt").to(device)
+                                    translated_ids = model.generate(
+                                        inputs["input_ids"],
+                                        max_length=max_length,
+                                        num_beams=num_beams,
+                                        temperature=temperature,
+                                        repetition_penalty=repetition_penalty,
+                                        length_penalty=length_penalty,
+                                        no_repeat_ngram_size=no_repeat_ngram_size,
+                                        early_stopping=True
+                                    )
+                                    translated_text = tokenizer.decode(translated_ids[0], skip_special_tokens=True)
+                                    translated_parts.append(translated_text)
 
-        self.close_btn = QPushButton("Cerrar")
-        self.close_btn.clicked.connect(self.close)
-        btn_layout.addWidget(self.close_btn)
+                            translated_text = ''.join(translated_parts)
+                            translated_text = ensure_spaces_around_brackets(translated_text)
+                            translated_text = preserve_html_colors(translated_text)
+                        except Exception as e:
+                            translated_text = f'{text_to_translate}  # Error: {str(e)}'
 
-        # Mostrar la ventana principal
-        self.show()
+                        indentation = line[:line.index(stripped_line)]
+                        translated_line = f'{indentation}{parts[0]}"{translated_text}"{parts[2]}\n'
+                        translated_lines.append(translated_line)
+                else:
+                    translated_lines.append(line)
+            else:
+                translated_lines.append(line)
 
-    def update_slider_labels(self):
-        self.max_length_label.setText(f"{self.max_length_slider.value()}")
-        self.num_beams_label.setText(f"{self.num_beams_slider.value()}")
+        index += 1
+        if progress_callback:
+            progress_callback(int((index + 1) / total_lines * 100))
 
-    def start_translation(self):
-        if self.is_translating:
-            QMessageBox.warning(self, "Advertencia", "Ya se está realizando una traducción.")
-            return
-        
-        self.is_translating = True
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-
-        # Iniciar el timer para la traducción continua
-        self.translation_timer.start(1000)  # Cada segundo
-
-    def stop_translation(self):
-        self.is_translating = False
-        self.translation_timer.stop()
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-
-    def translate_text(self):
-        # Obtener los valores de los sliders
-        max_length = self.max_length_slider.value()
-        num_beams = self.num_beams_slider.value()
-
-        # Texto a traducir
-        texto_en_ingles = self.source_textedit.toPlainText()
-
-        # Traducción del texto
-        inputs = self.tokenizer(texto_en_ingles, return_tensors="pt").to(self.device)
-        translated_ids = self.model.generate(inputs["input_ids"], max_length=max_length, num_beams=num_beams, early_stopping=True)
-        translated_text = self.tokenizer.decode(translated_ids[0], skip_special_tokens=True)
-
-        # Mostrar resultados en el QTextEdit de destino
-        self.target_textedit.setPlainText(translated_text)
-
-    def closeEvent(self, event):
-        # Detener la traducción al cerrar la ventana
-        if self.is_translating:
-            self.stop_translation()
-        event.accept()
+    with open(file_path, 'w', encoding='utf-8') as file:
+        file.writelines(translated_lines)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    ex = TranslatorApp()
+
+    model_name = "Helsinki-NLP/opus-mt-en-es"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to("cuda")
+
+    main_window = TranslatorApp(model_name, tokenizer, model, "cuda")
+    main_window.translate_text_in_file = lambda file_path: translate_text_in_file(
+        file_path,
+        tokenizer,
+        model,
+        "cuda",
+        main_window.max_length_slider.value(),
+        main_window.num_beams_slider.value(),
+        main_window.temperature_slider.value() / 10.0,
+        main_window.repetition_penalty_slider.value() / 10.0,
+        main_window.length_penalty_slider.value() / 10.0,
+        main_window.no_repeat_ngram_size_slider.value(),
+        main_window.progress_bar.setValue
+    )
+
     sys.exit(app.exec())
+
