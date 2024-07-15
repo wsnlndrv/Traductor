@@ -5,11 +5,11 @@ Si quieres que funcione rapido, necesitaras una buena tarjeta gráfica.
 
 Requisitos:
 
-huggingface-hub
-transformers
-langdetect
-pyqt6
-torch
+-huggingface-hub
+-transformers
+-langdetect
+-pyqt6
+-torch
 
 La licencia es HSCC.
 Haz lo que te salga de los cojones con el código.
